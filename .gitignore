@@ -1,0 +1,13 @@
+/sorter
+/sorter-*
+/sorter.log
+/data/
+/config.yaml
+/web/node_modules/
+/web/dist/
+/web/tsconfig.tsbuildinfo
+/internal/server/dist/
+!internal/server/dist/index.html
+*.db
+*.db-wal
+*.db-shm

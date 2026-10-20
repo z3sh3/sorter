@@ -1,0 +1,29 @@
+# Sorter 发票管理工具配置示例
+# 复制为 config.yaml 并修改后使用: cp config.example.yaml config.yaml
+
+server:
+  addr: ":8080"
+
+auth:
+  # 预置访问 token 的 SHA-256 哈希，生成方式:
+  #   ./sorter hash-token 你的访问token
+  token_hash: ""
+  # 登录会话有效期（签发的 JWT）
+  jwt_ttl: 168h # 7 天
+
+llm:
+  # OpenAI 兼容接口，示例:
+  #   OpenAI:    https://api.openai.com/v1
+  #   通义千问:   https://dashscope.aliyuncs.com/compatible-mode/v1
+  #   豆包:      https://ark.cn-beijing.volces.com/api/v3
+  base_url: ""
+  api_key: ""
+  model: "" # 需要支持视觉/多模态，如 gpt-4o-mini / qwen-vl-max 等
+  timeout: 60s
+
+storage:
+  db_path: "./data/sorter.db"
+  upload_dir: "./data/uploads"
+
+extractor:
+  workers: 2 # LLM 提取并发数
