@@ -3,7 +3,10 @@
 package config
 
 import (
+	"bytes"
+	"encoding/hex"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -64,8 +67,12 @@ func Load(path string) (*Config, error) {
 			return nil, fmt.Errorf("read config file: %w", err)
 		}
 		// Missing file is tolerated: rely on defaults + env vars.
-	} else if err := yaml.Unmarshal(data, cfg); err != nil {
-		return nil, fmt.Errorf("parse config file: %w", err)
+	} else {
+		decoder := yaml.NewDecoder(bytes.NewReader(data))
+		decoder.KnownFields(true)
+		if err := decoder.Decode(cfg); err != nil {
+			return nil, fmt.Errorf("parse config file: %w", err)
+		}
 	}
 
 	applyEnvOverrides(cfg)
@@ -101,8 +108,25 @@ func (c *Config) validate() error {
 	if c.LLM.BaseURL == "" || c.LLM.APIKey == "" || c.LLM.Model == "" {
 		return fmt.Errorf("llm.base_url, llm.api_key and llm.model are all required")
 	}
-	if c.Extractor.Workers < 1 {
-		c.Extractor.Workers = 1
+	raw, err := hex.DecodeString(strings.TrimPrefix(c.Auth.TokenHash, "sha256:"))
+	if err != nil || len(raw) != 32 {
+		return fmt.Errorf("auth.token_hash must contain 32 SHA-256 bytes")
+	}
+	if c.Auth.JWTTTL <= 0 || c.Auth.JWTTTL > 30*24*time.Hour {
+		return fmt.Errorf("auth.jwt_ttl must be positive and at most 720h")
+	}
+	u, err := url.Parse(c.LLM.BaseURL)
+	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("llm.base_url must be an HTTP(S) URL without credentials, query or fragment")
+	}
+	if c.LLM.Timeout <= 0 || c.LLM.Timeout > 3*time.Minute {
+		return fmt.Errorf("llm.timeout must be positive and at most 3m")
+	}
+	if c.Extractor.Workers < 1 || c.Extractor.Workers > 16 {
+		return fmt.Errorf("extractor.workers must be between 1 and 16")
+	}
+	if c.Storage.DBPath == "" || c.Storage.UploadDir == "" {
+		return fmt.Errorf("storage paths must not be empty")
 	}
 	return nil
 }

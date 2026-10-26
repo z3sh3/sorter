@@ -7,8 +7,9 @@ server:
 auth:
   # 预置访问 token 的 SHA-256 哈希，生成方式:
   #   ./sorter hash-token 你的访问token
+  # 必须是 32 字节 SHA-256；修改或重启进程会使已签发的会话失效。
   token_hash: ""
-  # 登录会话有效期（签发的 JWT）
+  # 登录会话有效期（签发的 JWT），最大 720h
   jwt_ttl: 168h # 7 天
 
 llm:
@@ -19,11 +20,11 @@ llm:
   base_url: ""
   api_key: ""
   model: "" # 需要支持视觉/多模态，如 gpt-4o-mini / qwen-vl-max 等
-  timeout: 60s
+  timeout: 60s # 单次请求超时，最大 3m
 
 storage:
   db_path: "./data/sorter.db"
   upload_dir: "./data/uploads"
 
 extractor:
-  workers: 2 # LLM 提取并发数
+  workers: 2 # LLM 提取并发数，范围 1-16

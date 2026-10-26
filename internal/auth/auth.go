@@ -3,10 +3,10 @@
 package auth
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -22,14 +22,21 @@ type Manager struct {
 }
 
 // NewManager builds a Manager from the configured "sha256:<hex>" token hash.
-// The hash itself doubles as the JWT signing secret: changing the configured
-// token therefore invalidates all previously issued sessions.
+// A random per-process signing key keeps password verification and JWT signing
+// independent. Restarting the process invalidates existing sessions.
 func NewManager(tokenHashConfig string, ttl time.Duration) (*Manager, error) {
 	raw, err := hex.DecodeString(strings.TrimPrefix(tokenHashConfig, "sha256:"))
 	if err != nil || len(raw) != sha256.Size {
 		return nil, fmt.Errorf("invalid token_hash format")
 	}
-	return &Manager{tokenHash: raw, secret: raw, ttl: ttl}, nil
+	if ttl <= 0 || ttl > 30*24*time.Hour {
+		return nil, fmt.Errorf("jwt ttl must be between 0 and 30 days")
+	}
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		return nil, err
+	}
+	return &Manager{tokenHash: raw, secret: secret, ttl: ttl}, nil
 }
 
 // VerifyToken compares the presented token against the configured hash
@@ -44,6 +51,7 @@ func (m *Manager) Issue() (string, time.Time, error) {
 	expiresAt := time.Now().Add(m.ttl)
 	claims := jwt.MapClaims{
 		"sub": "admin",
+		"iss": "sorter",
 		"iat": time.Now().Unix(),
 		"exp": expiresAt.Unix(),
 	}
@@ -54,13 +62,7 @@ func (m *Manager) Issue() (string, time.Time, error) {
 // Validate parses and validates a bearer JWT string.
 func (m *Manager) Validate(tokenString string) error {
 	_, err := jwt.Parse(tokenString, func(t *jwt.Token) (any, error) {
-		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
-		}
 		return m.secret, nil
-	})
+	}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithExpirationRequired(), jwt.WithIssuedAt(), jwt.WithIssuer("sorter"), jwt.WithSubject("admin"))
 	return err
 }
-
-// ErrUnauthorized is returned when credentials are missing or invalid.
-var ErrUnauthorized = errors.New("unauthorized")
