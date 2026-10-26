@@ -19,7 +19,7 @@ import type { StatItem, Summary } from "@/api/types"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { categoryLabel, formatMoney } from "@/lib/format"
+import { CATEGORIES, CURRENCIES, categoryLabel, formatMoney } from "@/lib/format"
 
 const CHART_COLORS = [
   "var(--color-chart-1)",
@@ -30,28 +30,59 @@ const CHART_COLORS = [
 ]
 
 export default function Dashboard() {
-  const [summary, setSummary] = useState<Summary | null>(null)
+  const [summaries, setSummaries] = useState<Summary[]>([])
+  const [currency, setCurrency] = useState<string>("CNY")
   const [monthly, setMonthly] = useState<StatItem[]>([])
   const [byCategory, setByCategory] = useState<StatItem[]>([])
   const [bySeller, setBySeller] = useState<StatItem[]>([])
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
+    const controller = new AbortController()
+    api
+      .summary(controller.signal)
+      .then((result) => {
+        if (controller.signal.aborted) return
+        setSummaries(result.items)
+        // Default to the currency that actually holds data.
+        if (result.items.length > 0 && !result.items.some((item) => item.currency === currency)) {
+          setCurrency(result.items[0].currency)
+        }
+      })
+      .catch((err) => {
+        if (!controller.signal.aborted) {
+          toast.error("加载统计数据失败: " + (err instanceof Error ? err.message : ""))
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoading(false)
+      })
+    return () => controller.abort()
+  }, [currency])
+
+  // Amounts are never converted: every chart shows exactly one currency.
+  useEffect(() => {
+    const controller = new AbortController()
     Promise.all([
-      api.summary(),
-      api.stats("month"),
-      api.stats("category"),
-      api.stats("seller"),
+      api.stats("month", currency, controller.signal),
+      api.stats("category", currency, controller.signal),
+      api.stats("seller", currency, controller.signal),
     ])
-      .then(([s, m, c, sel]) => {
-        setSummary(s)
+      .then(([m, c, sel]) => {
+        if (controller.signal.aborted) return
         setMonthly(m.items)
         setByCategory(c.items)
         setBySeller(sel.items.slice(0, 10))
       })
-      .catch((err) => toast.error("加载统计数据失败: " + (err instanceof Error ? err.message : "")))
-      .finally(() => setLoading(false))
-  }, [])
+      .catch((err) => {
+        if (!controller.signal.aborted) {
+          toast.error("加载统计数据失败: " + (err instanceof Error ? err.message : ""))
+        }
+      })
+    return () => controller.abort()
+  }, [currency])
+
+  const summary = summaries.find((item) => item.currency === currency)
 
   const categoryData = useMemo(
     () => byCategory.map((c) => ({ ...c, name: categoryLabel(c.period) })),
@@ -59,14 +90,50 @@ export default function Dashboard() {
   )
 
   const cards = [
-    { label: "累计报销金额", value: formatMoney(summary?.total_amount ?? 0) },
+    { label: "累计金额", value: formatMoney(summary?.total_amount ?? 0, currency) },
     { label: "累计发票张数", value: `${summary?.total_count ?? 0} 张` },
-    { label: "本月金额", value: formatMoney(summary?.month_amount ?? 0) },
+    { label: "本月金额", value: formatMoney(summary?.month_amount ?? 0, currency) },
     { label: "本月张数", value: `${summary?.month_count ?? 0} 张` },
   ]
 
   return (
     <div className="flex flex-col gap-6">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h2 className="text-lg font-semibold">概览</h2>
+          <p className="text-sm text-muted-foreground">
+            统计仅含已确认发票，币种之间不做折算
+          </p>
+        </div>
+        <label className="flex items-center gap-2 text-sm">
+          <span className="text-muted-foreground">币种</span>
+          <select
+            aria-label="统计币种"
+            className="h-9 rounded-md border bg-background px-2"
+            value={currency}
+            onChange={(event) => setCurrency(event.target.value)}
+          >
+            {CURRENCIES.map((item) => (
+              <option key={item} value={item}>
+                {item}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+
+      {(summary?.review_count ?? 0) > 0 && (
+        <Card className="border-amber-300 bg-amber-50 dark:bg-amber-950/30">
+          <CardContent className="flex flex-wrap items-center justify-between gap-2 pt-6 text-sm">
+            <span>
+              有 <strong>{summary?.review_count}</strong> 张 {currency} 发票字段不完整，未计入统计
+            </span>
+            <a className="font-medium underline" href="/invoices?status=needs_review">
+              去复核
+            </a>
+          </CardContent>
+        </Card>
+      )}
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
         {cards.map((c) => (
           <Card key={c.label} className="gap-2 py-4">
@@ -99,10 +166,7 @@ export default function Dashboard() {
                   <CartesianGrid strokeDasharray="3 3" vertical={false} />
                   <XAxis dataKey="period" fontSize={12} tickLine={false} axisLine={false} />
                   <YAxis fontSize={12} tickLine={false} axisLine={false} />
-                  <Tooltip
-                    formatter={(value) => [formatMoney(Number(value)), "金额"]}
-                    labelFormatter={(label) => `${label}`}
-                  />
+                    <Tooltip formatter={(value) => [formatMoney(Number(value), currency), "金额"]} />
                   <Bar dataKey="total" fill="var(--color-chart-2)" radius={[4, 4, 0, 0]} />
                 </BarChart>
               </ResponsiveContainer>
@@ -133,7 +197,10 @@ export default function Dashboard() {
                       <Cell key={i} fill={CHART_COLORS[i % CHART_COLORS.length]} />
                     ))}
                   </Pie>
-                  <Tooltip formatter={(value) => formatMoney(Number(value))} />
+                  <Tooltip
+                    formatter={(value) => [formatMoney(Number(value), currency), currency]}
+                    labelFormatter={(label) => `分类：${label}`}
+                  />
                   <Legend />
                 </PieChart>
               </ResponsiveContainer>
@@ -145,7 +212,7 @@ export default function Dashboard() {
       <Card>
         <CardHeader>
           <CardTitle>销售方排行</CardTitle>
-          <CardDescription>按开票方汇总金额（前 10 名）</CardDescription>
+          <CardDescription>按开票方汇总金额（前 10 名，{currency}）</CardDescription>
         </CardHeader>
         <CardContent>
           {bySeller.length === 0 && !loading ? (
@@ -164,7 +231,7 @@ export default function Dashboard() {
                   <TableRow key={s.period + i}>
                     <TableCell className="max-w-0 truncate">{s.period}</TableCell>
                     <TableCell className="text-right">{s.count}</TableCell>
-                    <TableCell className="text-right font-medium">{formatMoney(s.total)}</TableCell>
+                    <TableCell className="text-right font-medium">{formatMoney(s.total, currency)}</TableCell>
                   </TableRow>
                 ))}
               </TableBody>

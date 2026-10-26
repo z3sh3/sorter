@@ -27,6 +27,13 @@ export function StatusBadge({ status, error }: { status: string; error?: string 
       </Badge>
     )
   }
+  if (status === "needs_review") {
+    return (
+      <Badge className="border-transparent bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300">
+        待复核
+      </Badge>
+    )
+  }
   if (status === "failed") {
     return (
       <Badge variant="destructive" title={error}>

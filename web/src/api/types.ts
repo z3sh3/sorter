@@ -11,9 +11,12 @@ export interface Invoice {
   buyer_name: string
   drawer: string
   category: string
-  status: "processing" | "done" | "failed"
+  status: "processing" | "done" | "failed" | "needs_review"
+  version: number
+  confidence: number
+  review_reason: string
   error_message: string
-  raw_response: string
+  raw_response?: string
   notes: string
   created_at: string
   updated_at: string
@@ -33,10 +36,12 @@ export interface StatItem {
 }
 
 export interface Summary {
+  currency: string
   total_count: number
   total_amount: number
   month_count: number
   month_amount: number
+  review_count: number
 }
 
 export interface UploadResult {
@@ -47,9 +52,12 @@ export interface UploadResult {
 }
 
 export interface UpdateInvoicePayload {
+  version: number
+  confirm?: boolean
+  currency?: string
   invoice_number?: string
   invoice_date?: string
-  amount?: number
+  amount?: string
   seller_name?: string
   buyer_name?: string
   drawer?: string

@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
+import { useSearchParams } from "react-router-dom"
 import { toast } from "sonner"
 import {
   ChevronLeft,
@@ -36,19 +37,31 @@ import {
 } from "@/components/ui/select"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Textarea } from "@/components/ui/textarea"
-import { CATEGORIES, formatMoney } from "@/lib/format"
+import { CATEGORIES, CURRENCIES, formatMoney } from "@/lib/format"
+import { useInvoices } from "@/hooks/useInvoices"
+import { useInvoicePreview } from "@/hooks/useInvoicePreview"
 
 const PAGE_SIZE = 15
+const STATUS_OPTIONS = [
+  { value: "processing", label: "提取中" },
+  { value: "done", label: "已提取" },
+  { value: "needs_review", label: "待复核" },
+  { value: "failed", label: "失败" },
+] as const
+const STATUS_VALUES = new Set<string>(STATUS_OPTIONS.map((option) => option.value))
 
 export default function Invoices() {
-  const [items, setItems] = useState<Invoice[]>([])
-  const [total, setTotal] = useState(0)
+  const [searchParams] = useSearchParams()
+  const initialStatus = searchParams.get("status") ?? ""
   const [page, setPage] = useState(1)
-  const [loading, setLoading] = useState(false)
+  const [applied, setApplied] = useState<ListParams>(
+    STATUS_VALUES.has(initialStatus) ? { status: initialStatus } : {}
+  )
 
   // Filters
   const [keyword, setKeyword] = useState("")
   const [category, setCategory] = useState("")
+  const [status, setStatus] = useState(STATUS_VALUES.has(initialStatus) ? initialStatus : "")
   const [startDate, setStartDate] = useState("")
   const [endDate, setEndDate] = useState("")
 
@@ -57,63 +70,34 @@ export default function Invoices() {
   const [editing, setEditing] = useState<Invoice | null>(null)
   const [deleting, setDeleting] = useState<Invoice | null>(null)
 
-  const load = useCallback(async (p: ListParams) => {
-    setLoading(true)
-    try {
-      const res = await api.listInvoices({ page_size: PAGE_SIZE, ...p })
-      setItems(res.items)
-      setTotal(res.total)
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "加载失败")
-    } finally {
-      setLoading(false)
-    }
-  }, [])
-
-  const currentParams = useMemo<ListParams>(
-    () => ({
-      page,
-      category,
-      keyword: keyword.trim(),
-      start_date: startDate,
-      end_date: endDate,
-    }),
-    [page, category, keyword, startDate, endDate]
-  )
-
-  useEffect(() => {
-    load(currentParams)
-  }, [currentParams, load])
-
-  // Auto-refresh while any row is still being processed.
-  useEffect(() => {
-    if (!items.some((i) => i.status === "processing")) return
-    const timer = setInterval(() => load(currentParams), 3000)
-    return () => clearInterval(timer)
-  }, [items, currentParams, load])
-
+  const currentParams = useMemo<ListParams>(() => ({ ...applied, page, page_size: PAGE_SIZE }), [applied, page])
+  const { items, total, loading, refresh } = useInvoices(currentParams)
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
+  useEffect(() => { if (!loading && page > totalPages) setPage(totalPages) }, [loading, page, totalPages])
 
   const applyFilters = () => {
+    if (startDate && endDate && startDate > endDate) { toast.error("开始日期不能晚于结束日期"); return }
     setPage(1)
-    load({ ...currentParams, page: 1 })
+    setApplied({ category, status, keyword: keyword.trim(), start_date: startDate, end_date: endDate })
   }
 
   const resetFilters = () => {
     setKeyword("")
     setCategory("")
+    setStatus("")
     setStartDate("")
     setEndDate("")
     setPage(1)
+    setApplied({})
   }
 
   const doDelete = async () => {
     if (!deleting) return
     try {
-      await api.deleteInvoice(deleting.id)
+      await api.deleteInvoice(deleting.id, deleting.version)
       toast.success("已删除")
       setDeleting(null)
-      load(currentParams)
+      refresh()
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "删除失败")
     }
@@ -139,7 +123,7 @@ export default function Invoices() {
           </div>
           <div className="flex flex-col gap-1.5">
             <Label>分类</Label>
-            <Select value={category} onValueChange={(v) => { setCategory(v === "__all__" ? "" : v); setPage(1) }}>
+            <Select value={category || "__all__"} onValueChange={(v) => setCategory(v === "__all__" ? "" : v)}>
               <SelectTrigger className="w-36">
                 <SelectValue placeholder="全部分类" />
               </SelectTrigger>
@@ -148,6 +132,22 @@ export default function Invoices() {
                 {CATEGORIES.map((c) => (
                   <SelectItem key={c.value} value={c.value}>
                     {c.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="flex flex-col gap-1.5">
+            <Label>状态</Label>
+            <Select value={status || "__all__"} onValueChange={(v) => setStatus(v === "__all__" ? "" : v)}>
+              <SelectTrigger className="w-32">
+                <SelectValue placeholder="全部状态" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="__all__">全部状态</SelectItem>
+                {STATUS_OPTIONS.map((option) => (
+                  <SelectItem key={option.value} value={option.value}>
+                    {option.label}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -167,7 +167,7 @@ export default function Invoices() {
           <Button variant="outline" onClick={resetFilters}>
             <RotateCcw className="size-4" /> 重置
           </Button>
-          <Button variant="ghost" onClick={() => load(currentParams)} title="刷新">
+          <Button variant="ghost" onClick={refresh} title="刷新">
             <RefreshCw className="size-4" />
           </Button>
         </CardContent>
@@ -199,7 +199,9 @@ export default function Invoices() {
                     {inv.seller_name || "—"}
                   </TableCell>
                   <TableCell className="text-right font-medium">
-                    {inv.status === "done" ? formatMoney(inv.amount, inv.currency) : "—"}
+          					{inv.status === "done" || inv.status === "needs_review"
+						? formatMoney(inv.amount, inv.currency)
+						: "—"}
                   </TableCell>
                   <TableCell>
                     <CategoryBadge value={inv.category} />
@@ -212,13 +214,14 @@ export default function Invoices() {
                       <Button variant="ghost" size="icon" title="详情" onClick={() => setDetail(inv)}>
                         <Eye className="size-4" />
                       </Button>
-                      <Button variant="ghost" size="icon" title="编辑" onClick={() => setEditing(inv)}>
+                      <Button disabled={inv.status === "processing"} variant="ghost" size="icon" title="编辑" onClick={() => setEditing(inv)}>
                         <Pencil className="size-4" />
                       </Button>
                       <Button
                         variant="ghost"
                         size="icon"
                         title="删除"
+                        disabled={inv.status === "processing"}
                         className="text-destructive hover:text-destructive"
                         onClick={() => setDeleting(inv)}
                       >
@@ -260,13 +263,13 @@ export default function Invoices() {
         </CardContent>
       </Card>
 
-      <DetailDialog invoice={detail} onClose={() => setDetail(null)} onChanged={() => load(currentParams)} />
+      <DetailDialog invoice={detail} onClose={() => setDetail(null)} onChanged={refresh} />
       <EditDialog
         invoice={editing}
         onClose={() => setEditing(null)}
         onSaved={() => {
           setEditing(null)
-          load(currentParams)
+          refresh()
         }}
       />
 
@@ -304,32 +307,14 @@ function DetailDialog({
   onClose: () => void
   onChanged: () => void
 }) {
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null)
+  const { url: previewUrl, error: previewError } = useInvoicePreview(invoice?.id)
   const isPdf = invoice?.file_name.toLowerCase().endsWith(".pdf") ?? false
-
-  useEffect(() => {
-    if (!invoice) {
-      setPreviewUrl(null)
-      return
-    }
-    let revoked: string | null = null
-    api
-      .fetchFileBlob(invoice.id)
-      .then((blob) => {
-        revoked = URL.createObjectURL(blob)
-        setPreviewUrl(revoked)
-      })
-      .catch(() => setPreviewUrl(null))
-    return () => {
-      if (revoked) URL.revokeObjectURL(revoked)
-    }
-  }, [invoice])
 
   if (!invoice) return null
 
   const reExtract = async () => {
     try {
-      await api.reExtract(invoice.id)
+      await api.reExtract(invoice.id, invoice.version)
       toast.success("已重新提交提取")
       onChanged()
       onClose()
@@ -341,12 +326,13 @@ function DetailDialog({
   const fields: [string, React.ReactNode][] = [
     ["开票日期", invoice.invoice_date || "—"],
     ["发票号码", invoice.invoice_number || "—"],
-    ["金额", invoice.status === "done" ? formatMoney(invoice.amount, invoice.currency) : "—"],
+    ["金额", invoice.status === "done" || invoice.status === "needs_review" ? formatMoney(invoice.amount, invoice.currency) : "—"],
     ["销售方", invoice.seller_name || "—"],
     ["购买方", invoice.buyer_name || "—"],
     ["开票人", invoice.drawer || "—"],
     ["分类", <CategoryBadge key="cat" value={invoice.category} />],
     ["状态", <StatusBadge key="st" status={invoice.status} error={invoice.error_message} />],
+    ["复核提示", invoice.review_reason || "—"],
     ["备注", invoice.notes || "—"],
     ["导入时间", new Date(invoice.created_at).toLocaleString("zh-CN")],
   ]
@@ -368,7 +354,7 @@ function DetailDialog({
             ) : (
               <div className="flex flex-col items-center gap-2 text-muted-foreground">
                 <FileImage className="size-8" />
-                <span className="text-sm">预览加载中…</span>
+                <span className="text-sm">{previewError || "预览加载中…"}</span>
               </div>
             )}
           </div>
@@ -387,7 +373,7 @@ function DetailDialog({
           </div>
         </div>
         <DialogFooter>
-          <Button variant="outline" onClick={reExtract}>
+          <Button disabled={invoice.status === "processing"} variant="outline" onClick={reExtract}>
             <RefreshCw className="size-4" /> 重新提取
           </Button>
           <Button variant="outline" onClick={onClose}>
@@ -414,6 +400,7 @@ function EditDialog({
     invoice_number: "",
     invoice_date: "",
     amount: "",
+    currency: "CNY",
     seller_name: "",
     buyer_name: "",
     drawer: "",
@@ -427,7 +414,8 @@ function EditDialog({
       setForm({
         invoice_number: invoice.invoice_number,
         invoice_date: invoice.invoice_date,
-        amount: invoice.amount ? invoice.amount.toFixed(2) : "",
+        amount: invoice.amount.toFixed(2),
+        currency: invoice.currency,
         seller_name: invoice.seller_name,
         buyer_name: invoice.buyer_name,
         drawer: invoice.drawer,
@@ -443,14 +431,17 @@ function EditDialog({
     setForm((f) => ({ ...f, [key]: e.target.value }))
 
   const save = async () => {
-    const amount = form.amount.trim() === "" ? 0 : Number(form.amount)
-    if (Number.isNaN(amount) || amount < 0) {
-      toast.error("金额必须是非负数字")
+    const amount = form.amount.trim()
+    if (!/^-?\d+(\.\d{1,2})?$/.test(amount) || !Number.isFinite(Number(amount))) {
+      toast.error("请输入金额，最多两位小数；红字发票可填负数")
       return
     }
     setSaving(true)
     try {
       await api.updateInvoice(invoice.id, {
+        version: invoice.version,
+        confirm: true,
+        currency: form.currency,
         invoice_number: form.invoice_number.trim(),
         invoice_date: form.invoice_date.trim(),
         amount,
@@ -474,7 +465,7 @@ function EditDialog({
       <DialogContent>
         <DialogHeader>
           <DialogTitle>编辑发票 · {invoice.file_name}</DialogTitle>
-          <DialogDescription>修正提取有误的字段后保存</DialogDescription>
+          <DialogDescription>确认字段完整准确后保存；确认后的发票才计入统计</DialogDescription>
         </DialogHeader>
         <div className="grid grid-cols-2 gap-3">
           <Field label="开票日期">
@@ -483,8 +474,13 @@ function EditDialog({
           <Field label="发票号码">
             <Input value={form.invoice_number} onChange={set("invoice_number")} />
           </Field>
-          <Field label="金额（元）">
-            <Input type="number" step="0.01" min="0" value={form.amount} onChange={set("amount")} />
+          <Field label="金额（币种主单位）">
+            <Input type="text" inputMode="decimal" value={form.amount} onChange={set("amount")} />
+          </Field>
+          <Field label="币种">
+            <select aria-label="币种" value={form.currency} onChange={(e) => setForm((f) => ({ ...f, currency: e.target.value }))}>
+              {CURRENCIES.map((currency) => <option key={currency}>{currency}</option>)}
+            </select>
           </Field>
           <Field label="分类">
             <Select value={form.category} onValueChange={(v) => setForm((f) => ({ ...f, category: v }))}>
@@ -520,7 +516,7 @@ function EditDialog({
             取消
           </Button>
           <Button onClick={save} disabled={saving}>
-            {saving ? "保存中…" : "保存"}
+            {saving ? "保存中…" : "确认并保存"}
           </Button>
         </DialogFooter>
       </DialogContent>

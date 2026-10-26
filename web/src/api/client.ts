@@ -83,19 +83,19 @@ export const api = {
       body: JSON.stringify({ token }),
     }),
 
-  listInvoices: (params: ListParams) =>
-    json<ListResponse>("/invoices" + toQuery({ ...params })),
+  listInvoices: (params: ListParams, signal?: AbortSignal) =>
+    json<ListResponse>("/invoices" + toQuery({ ...params }), { signal }),
 
-  getInvoice: (id: number) => json<Invoice>(`/invoices/${id}`),
+  getInvoice: (id: number, signal?: AbortSignal) => json<Invoice>(`/invoices/${id}`, { signal }),
 
   updateInvoice: (id: number, payload: UpdateInvoicePayload) =>
     json<Invoice>(`/invoices/${id}`, { method: "PUT", body: JSON.stringify(payload) }),
 
-  deleteInvoice: (id: number) =>
-    json<{ deleted: boolean }>(`/invoices/${id}`, { method: "DELETE" }),
+  deleteInvoice: (id: number, version: number) =>
+    json<{ deleted: boolean }>(`/invoices/${id}?version=${version}`, { method: "DELETE" }),
 
-  reExtract: (id: number) =>
-    json<{ status: string }>(`/invoices/${id}/re-extract`, { method: "POST" }),
+  reExtract: (id: number, version: number) =>
+    json<{ status: string }>(`/invoices/${id}/re-extract`, { method: "POST", body: JSON.stringify({ version }) }),
 
   upload: (files: File[]) => {
     const form = new FormData()
@@ -103,14 +103,14 @@ export const api = {
     return json<{ results: UploadResult[] }>("/invoices", { method: "POST", body: form })
   },
 
-  stats: (groupBy: string, startDate = "", endDate = "") =>
-    json<{ items: StatItem[] }>("/stats" + toQuery({ group_by: groupBy, start_date: startDate, end_date: endDate })),
+  stats: (groupBy: string, currency: string, signal?: AbortSignal) =>
+    json<{ items: StatItem[]; currency: string }>("/stats" + toQuery({ group_by: groupBy, currency }), { signal }),
 
-  summary: () => json<Summary>("/stats/summary"),
+  summary: (signal?: AbortSignal) => json<{ items: Summary[] }>("/stats/summary", { signal }),
 
   // fetchFileBlob loads the original invoice file with auth headers for preview.
-  fetchFileBlob: async (id: number): Promise<Blob> => {
-    const res = await request(`/invoices/${id}/file`)
+  fetchFileBlob: async (id: number, signal?: AbortSignal): Promise<Blob> => {
+    const res = await request(`/invoices/${id}/file`, { signal })
     return res.blob()
   },
 }

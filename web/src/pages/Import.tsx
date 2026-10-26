@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react"
 import { toast } from "sonner"
 import { FileUp, Loader2, RefreshCw, UploadCloud, X } from "lucide-react"
 
-import { api } from "@/api/client"
+import { api, ApiError } from "@/api/client"
 import type { UploadResult } from "@/api/types"
 import { CategoryBadge, StatusBadge } from "@/components/CategoryBadge"
 import { Button } from "@/components/ui/button"
@@ -35,28 +35,46 @@ export default function Import() {
     })
   }, [])
 
-  // Poll queued invoices until extraction finishes.
+  // Poll sequentially: a new round only starts after the previous one finished,
+  // and the request is canceled when the pending set changes or the page unmounts.
+  const pendingKey = tracked
+    .flatMap((t) => (!t.done && t.result.invoice_id ? [t.result.invoice_id] : []))
+    .join(",")
   useEffect(() => {
-    const pending = tracked.filter((t) => !t.done && t.result.invoice_id)
-    if (pending.length === 0) return
-    const timer = setInterval(async () => {
-      for (const item of pending) {
+    const ids = pendingKey ? pendingKey.split(",").map(Number) : []
+    if (ids.length === 0) return
+    const controller = new AbortController()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const poll = async () => {
+      const finished = new Map<number, Invoice>()
+      for (const id of ids) {
+        if (controller.signal.aborted) return
         try {
-          const inv = await api.getInvoice(item.result.invoice_id!)
-          if (inv.status !== "processing") {
-            setTracked((prev) =>
-              prev.map((t) =>
-                t.result.invoice_id === inv.id ? { ...t, invoice: inv, done: true } : t
-              )
-            )
-          }
-        } catch {
-          // keep polling; transient errors are fine
+          const inv = await api.getInvoice(id, controller.signal)
+          if (inv.status !== "processing") finished.set(id, inv)
+        } catch (err) {
+          if (controller.signal.aborted) return
+          // Missing or unauthorized records will never become available by polling.
+          if (err instanceof ApiError && (err.status === 404 || err.status === 401)) return
         }
       }
-    }, 2000)
-    return () => clearInterval(timer)
-  }, [tracked])
+      // Apply one state update per round instead of one render per invoice.
+      if (!controller.signal.aborted && finished.size > 0) {
+        setTracked((prev) =>
+          prev.map((t) => {
+            const inv = t.result.invoice_id ? finished.get(t.result.invoice_id) : undefined
+            return inv ? { ...t, invoice: inv, done: true } : t
+          })
+        )
+      }
+      if (!controller.signal.aborted) timer = setTimeout(poll, 2000)
+    }
+    void poll()
+    return () => {
+      controller.abort()
+      clearTimeout(timer)
+    }
+  }, [pendingKey])
 
   const doUpload = async () => {
     if (files.length === 0) return
@@ -82,9 +100,9 @@ export default function Import() {
     }
   }
 
-  const retry = async (invoiceId: number) => {
+  const retry = async (invoiceId: number, version: number) => {
     try {
-      await api.reExtract(invoiceId)
+      await api.reExtract(invoiceId, version)
       setTracked((prev) =>
         prev.map((t) =>
           t.result.invoice_id === invoiceId
@@ -194,7 +212,7 @@ export default function Import() {
   )
 }
 
-function TrackedRow({ item, onRetry }: { item: TrackedItem; onRetry: (id: number) => void }) {
+function TrackedRow({ item, onRetry }: { item: TrackedItem; onRetry: (id: number, version: number) => void }) {
   const { result, invoice, done } = item
 
   if (result.status === "duplicate") {
@@ -216,6 +234,7 @@ function TrackedRow({ item, onRetry }: { item: TrackedItem; onRetry: (id: number
 
   const processing = !done
   const failed = done && invoice?.status === "failed"
+  const needsReview = done && invoice?.status === "needs_review"
 
   return (
     <RowShell name={result.file_name}>
@@ -230,13 +249,21 @@ function TrackedRow({ item, onRetry }: { item: TrackedItem; onRetry: (id: number
           <span className="flex-1 truncate text-sm text-destructive" title={invoice?.error_message}>
             {invoice?.error_message}
           </span>
-          <Button variant="outline" size="sm" onClick={() => onRetry(result.invoice_id!)}>
+          <Button variant="outline" size="sm" onClick={() => onRetry(result.invoice_id!, invoice.version)}>
             <RefreshCw className="size-3.5" /> 重试
           </Button>
         </>
+      ) : needsReview ? (
+        <>
+          <StatusBadge status="needs_review" />
+          <CategoryBadge value={invoice.category} />
+          <span className="flex-1 truncate text-sm text-amber-700" title={invoice.review_reason}>
+            {invoice.review_reason || "字段不完整，请在发票列表中核对"}
+          </span>
+        </>
       ) : invoice ? (
         <>
-          <StatusBadge status="done" />
+          <StatusBadge status={invoice.status} />
           <CategoryBadge value={invoice.category} />
           <span className="text-sm">
             {invoice.invoice_date || "—"} · {invoice.seller_name || "未知销售方"} ·{" "}
