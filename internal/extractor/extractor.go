@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -19,16 +20,16 @@ import (
 
 // Result is the structured extraction output of the LLM.
 type Result struct {
-	InvoiceNumber string  `json:"invoice_number"`
-	InvoiceDate   string  `json:"invoice_date"`
-	TotalAmount   float64 `json:"total_amount"`
-	Currency      string  `json:"currency"`
-	SellerName    string  `json:"seller_name"`
-	BuyerName     string  `json:"buyer_name"`
-	Drawer        string  `json:"drawer"`
-	Category      string  `json:"category"`
-	Confidence    float64 `json:"confidence"`
-	Reason        string  `json:"reason"`
+	InvoiceNumber string         `json:"invoice_number"`
+	InvoiceDate   string         `json:"invoice_date"`
+	TotalAmount   *invoice.Money `json:"total_amount"`
+	Currency      string         `json:"currency"`
+	SellerName    string         `json:"seller_name"`
+	BuyerName     string         `json:"buyer_name"`
+	Drawer        string         `json:"drawer"`
+	Category      string         `json:"category"`
+	Confidence    float64        `json:"confidence"`
+	Reason        string         `json:"reason"`
 }
 
 // Service performs invoice extraction with a multimodal LLM.
@@ -55,12 +56,13 @@ func (e *apiError) Error() string {
 // It renders PDFs to PNG first, then calls the LLM with bounded retries.
 // Returns the normalized result plus the raw LLM response for auditability.
 func (s *Service) ExtractFromFile(ctx context.Context, path string) (*Result, string, error) {
-	imgBytes, mimeType, err := loadAsImage(path)
+	imgBytes, mimeType, err := loadAsImage(ctx, path)
 	if err != nil {
 		return nil, "", err
 	}
 
 	var lastErr error
+	var lastRaw string
 	for attempt := 1; attempt <= 3; attempt++ {
 		result, raw, err := s.client.Extract(ctx, imgBytes, mimeType)
 		if err == nil {
@@ -68,8 +70,9 @@ func (s *Service) ExtractFromFile(ctx context.Context, path string) (*Result, st
 			return result, raw, nil
 		}
 		lastErr = err
+		lastRaw = raw
 		var ae *apiError
-		if ok := errorAs(err, &ae); ok && ae.status != 0 && ae.status != http.StatusTooManyRequests && ae.status < 500 {
+		if ok := errors.As(err, &ae); ok && ae.status != 0 && ae.status != http.StatusTooManyRequests && ae.status < 500 {
 			break // 4xx (except 429): retrying will not help
 		}
 		if attempt < 3 {
@@ -80,47 +83,61 @@ func (s *Service) ExtractFromFile(ctx context.Context, path string) (*Result, st
 			}
 		}
 	}
-	return nil, "", fmt.Errorf("extraction failed after retries: %w", lastErr)
+	return nil, lastRaw, fmt.Errorf("extraction failed after retries: %w", lastErr)
 }
 
-// errorAs is a small local wrapper to avoid importing errors just for As.
-func errorAs(err error, target **apiError) bool {
-	for err != nil {
-		if ae, ok := err.(*apiError); ok {
-			*target = ae
-			return true
-		}
-		type unwrapper interface{ Unwrap() error }
-		u, ok := err.(unwrapper)
-		if !ok {
-			return false
-		}
-		err = u.Unwrap()
+// Invoice validates extracted fields before allowing them into statistics.
+func (r *Result) Invoice(raw string) *invoice.Invoice {
+	var cents int64
+	if r.TotalAmount != nil {
+		cents = int64(*r.TotalAmount)
 	}
-	return false
+	issues := []string{}
+	if r.TotalAmount == nil {
+		issues = append(issues, "amount missing")
+	}
+	if r.InvoiceNumber == "" {
+		issues = append(issues, "invoice number missing")
+	}
+	if r.SellerName == "" {
+		issues = append(issues, "seller missing")
+	}
+	if r.Confidence < 0.8 || r.Confidence > 1 {
+		issues = append(issues, "confidence below acceptance threshold or invalid")
+	}
+	if err := invoice.ValidateFields(r.InvoiceDate, cents, r.Currency, r.Category); err != nil {
+		issues = append(issues, err.Error())
+	}
+	status := invoice.StatusDone
+	if len(issues) > 0 {
+		status = invoice.StatusNeedsReview
+	}
+	return &invoice.Invoice{InvoiceNumber: r.InvoiceNumber, InvoiceDate: r.InvoiceDate, AmountCents: cents,
+		Currency: r.Currency, SellerName: r.SellerName, BuyerName: r.BuyerName, Drawer: r.Drawer, Category: r.Category,
+		Confidence: r.Confidence, ReviewReason: strings.Join(issues, "; "), RawResponse: raw, Status: status}
 }
 
 // loadAsImage returns image bytes ready for the LLM. PDF files are rendered
 // to PNG via the WebAssembly PDFium renderer.
-func loadAsImage(path string) ([]byte, string, error) {
+func loadAsImage(ctx context.Context, path string) ([]byte, string, error) {
 	ext := strings.ToLower(filepath.Ext(path))
 	if ext == ".pdf" {
 		renderer, err := SharedRenderer()
 		if err != nil {
 			return nil, "", fmt.Errorf("init pdf renderer: %w", err)
 		}
-		data, err := readFileLimit(path, 64<<20)
+		data, err := readFileLimit(path, invoice.MaxFileBytes)
 		if err != nil {
 			return nil, "", err
 		}
-		png, err := renderer.RenderFirstPagePNG(data)
+		png, err := renderer.RenderFirstPagePNG(ctx, data)
 		if err != nil {
 			return nil, "", err
 		}
 		return png, "image/png", nil
 	}
 
-	data, err := readFileLimit(path, 20<<20)
+	data, err := readFileLimit(path, invoice.MaxFileBytes)
 	if err != nil {
 		return nil, "", err
 	}
@@ -291,6 +308,9 @@ func (c *Client) Extract(ctx context.Context, img []byte, mimeType string) (*Res
 		return nil, raw, fmt.Errorf("llm rejected input: %s", probe.Error)
 	}
 
+	if strings.TrimSpace(cleaned) == "null" {
+		return nil, raw, fmt.Errorf("llm returned null")
+	}
 	var result Result
 	if err := json.Unmarshal([]byte(cleaned), &result); err != nil {
 		return nil, raw, fmt.Errorf("parse extraction result: %w", err)

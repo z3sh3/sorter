@@ -1,10 +1,11 @@
 package extractor
 
 import (
+	"context"
 	"fmt"
+	"math"
 	"os"
 	"sync"
-	"time"
 
 	gopdfium "github.com/klippa-app/go-pdfium"
 	"github.com/klippa-app/go-pdfium/requests"
@@ -44,8 +45,8 @@ func SharedRenderer() (*PDFRenderer, error) {
 
 // RenderFirstPagePNG renders page 0 of the given PDF at 150 DPI and
 // returns PNG-encoded bytes suitable for a multimodal LLM call.
-func (r *PDFRenderer) RenderFirstPagePNG(pdfData []byte) ([]byte, error) {
-	instance, err := r.pool.GetInstance(30 * time.Second)
+func (r *PDFRenderer) RenderFirstPagePNG(ctx context.Context, pdfData []byte) ([]byte, error) {
+	instance, err := r.pool.GetInstanceWithContext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("get pdfium instance: %w", err)
 	}
@@ -57,6 +58,24 @@ func (r *PDFRenderer) RenderFirstPagePNG(pdfData []byte) ([]byte, error) {
 	}
 	defer instance.FPDF_CloseDocument(&requests.FPDF_CloseDocument{Document: doc.Document})
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	count, err := instance.FPDF_GetPageCount(&requests.FPDF_GetPageCount{Document: doc.Document})
+	if err != nil {
+		return nil, err
+	}
+	if count.PageCount != 1 {
+		return nil, fmt.Errorf("only single-page invoice PDFs are supported; split this document first")
+	}
+	size, err := instance.FPDF_GetPageSizeByIndex(&requests.FPDF_GetPageSizeByIndex{Document: doc.Document, Index: 0})
+	if err != nil {
+		return nil, err
+	}
+	width, height := size.Width*150/72, size.Height*150/72
+	if math.IsNaN(width) || math.IsNaN(height) || width <= 0 || height <= 0 || width > 10000 || height > 10000 || width*height > 25_000_000 {
+		return nil, fmt.Errorf("PDF page dimensions exceed rendering limits")
+	}
 	render, err := instance.RenderToFile(&requests.RenderToFile{
 		RenderPageInDPI: &requests.RenderPageInDPI{
 			Page: requests.Page{
@@ -72,6 +91,9 @@ func (r *PDFRenderer) RenderFirstPagePNG(pdfData []byte) ([]byte, error) {
 	}
 	if render.ImageBytes == nil || len(*render.ImageBytes) == 0 {
 		return nil, fmt.Errorf("render pdf page: empty output")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return *render.ImageBytes, nil
 }

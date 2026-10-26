@@ -9,8 +9,9 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// dist holds the built frontend. It is populated by `make build`; the
-// checked-in placeholder keeps `go build` working without a frontend build.
+// dist holds the built frontend. `make build` writes the Vite output here;
+// the tracked .gitkeep keeps `go build` working on a clean checkout that has
+// not produced frontend assets yet.
 //
 //go:embed all:dist
 var dist embed.FS
@@ -20,8 +21,13 @@ var dist embed.FS
 func (s *Server) spaHandler() gin.HandlerFunc {
 	sub, err := fs.Sub(dist, "dist")
 	if err != nil {
-		panic(err)
+		// Only reachable if the embed directive itself is broken; fail closed.
+		return func(c *gin.Context) {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "frontend assets unavailable"})
+		}
 	}
+	info, statErr := fs.Stat(sub, "index.html")
+	shellMissing := statErr != nil || info.IsDir()
 	fileServer := http.FileServer(http.FS(sub))
 
 	return func(c *gin.Context) {
@@ -31,6 +37,10 @@ func (s *Server) spaHandler() gin.HandlerFunc {
 		}
 		if strings.HasPrefix(c.Request.URL.Path, "/api/") {
 			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+			return
+		}
+		if shellMissing {
+			c.String(http.StatusServiceUnavailable, "frontend assets are not built; run `make build`")
 			return
 		}
 
@@ -45,7 +55,9 @@ func (s *Server) spaHandler() gin.HandlerFunc {
 			fileServer.ServeHTTP(c.Writer, c.Request)
 			return
 		}
-		f.Close()
+		if closeErr := f.Close(); closeErr != nil {
+			c.Error(closeErr)
+		}
 
 		if name == "index.html" {
 			c.Header("Cache-Control", "no-cache")

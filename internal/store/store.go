@@ -1,8 +1,11 @@
 package store
 
 import (
+	"context"
+	"crypto/rand"
 	"database/sql"
 	"embed"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,83 +13,60 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
-
+	"modernc.org/sqlite"
 	"sorter/internal/invoice"
 )
 
 //go:embed migrations
 var migrationsFS embed.FS
 
-// Store wraps the SQLite database handle.
-type Store struct {
-	db *sql.DB
-}
+type Store struct{ db *sql.DB }
 
-// Open opens (creating if necessary) the SQLite database at dbPath,
-// sets pragmas and applies pending migrations.
 func Open(dbPath string) (*Store, error) {
-	if dir := filepath.Dir(dbPath); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return nil, fmt.Errorf("create db dir: %w", err)
+	if dir := filepath.Dir(dbPath); dir != "." {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return nil, err
 		}
 	}
-	db, err := sql.Open("sqlite", "file:"+dbPath)
+	db, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
 	if err != nil {
-		return nil, fmt.Errorf("open sqlite: %w", err)
+		return nil, err
 	}
-	// Single connection keeps WAL-mode writes serialized and avoids
-	// SQLITE_BUSY errors under the small worker pool.
 	db.SetMaxOpenConns(1)
-
-	for _, pragma := range []string{
-		"PRAGMA journal_mode=WAL;",
-		"PRAGMA foreign_keys=ON;",
-		"PRAGMA busy_timeout=5000;",
-	} {
-		if _, err := db.Exec(pragma); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("exec %q: %w", pragma, err)
-		}
-	}
-
-	s := &Store{db: db}
-	if err := s.migrate(); err != nil {
+	db.SetMaxIdleConns(1)
+	if _, err = db.Exec("PRAGMA journal_mode=WAL"); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("migrate: %w", err)
+		return nil, err
+	}
+	s := &Store{db: db}
+	if err = s.migrate(); err != nil {
+		db.Close()
+		return nil, err
 	}
 	return s, nil
 }
-
-// Close closes the underlying database.
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error                   { return s.db.Close() }
+func (s *Store) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
 
 func (s *Store) migrate() error {
-	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
-		name TEXT PRIMARY KEY,
-		applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-	)`); err != nil {
+	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations(name TEXT PRIMARY KEY, applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)`); err != nil {
 		return err
 	}
-
 	entries, err := migrationsFS.ReadDir("migrations")
 	if err != nil {
 		return err
 	}
-	names := make([]string, 0, len(entries))
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
-			names = append(names, e.Name())
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
+			continue
 		}
-	}
-	sort.Strings(names)
-
-	for _, name := range names {
-		var exists int
-		if err := s.db.QueryRow(`SELECT COUNT(1) FROM schema_migrations WHERE name = ?`, name).Scan(&exists); err != nil {
+		name := entry.Name()
+		var count int
+		if err := s.db.QueryRow("SELECT COUNT(*) FROM schema_migrations WHERE name=?", name).Scan(&count); err != nil {
 			return err
 		}
-		if exists > 0 {
+		if count > 0 {
 			continue
 		}
 		body, err := migrationsFS.ReadFile("migrations/" + name)
@@ -97,288 +77,234 @@ func (s *Store) migrate() error {
 		if err != nil {
 			return err
 		}
-		if _, err := tx.Exec(string(body)); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("apply %s: %w", name, err)
+		if _, err = tx.Exec(string(body)); err == nil {
+			_, err = tx.Exec("INSERT INTO schema_migrations(name) VALUES(?)", name)
 		}
-		if _, err := tx.Exec(`INSERT INTO schema_migrations(name) VALUES (?)`, name); err != nil {
+		if err != nil {
 			tx.Rollback()
-			return err
+			return fmt.Errorf("migration %s: %w", name, err)
 		}
-		if err := tx.Commit(); err != nil {
+		if err = tx.Commit(); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-const invoiceColumns = `id, file_name, file_path, file_hash, invoice_number, invoice_date,
-	amount, currency, seller_name, buyer_name, drawer, category, status,
-	error_message, raw_response, notes, created_at, updated_at`
+const invoiceColumns = `id,file_name,file_path,file_hash,invoice_number,invoice_date,amount,currency,seller_name,buyer_name,drawer,category,status,error_message,raw_response,notes,created_at,updated_at,version,extraction_token,confidence,review_reason`
 
 func scanInvoice(row interface{ Scan(...any) error }) (*invoice.Invoice, error) {
-	var inv invoice.Invoice
-	var num, date, seller, buyer, drawer, errMsg, raw, notes sql.NullString
-	err := row.Scan(&inv.ID, &inv.FileName, &inv.FilePath, &inv.FileHash,
-		&num, &date, &inv.AmountCents, &inv.Currency, &seller, &buyer, &drawer,
-		&inv.Category, &inv.Status, &errMsg, &raw, &notes, &inv.CreatedAt, &inv.UpdatedAt)
+	var i invoice.Invoice
+	var number, date, seller, buyer, drawer, message, raw, notes sql.NullString
+	err := row.Scan(&i.ID, &i.FileName, &i.FilePath, &i.FileHash, &number, &date, &i.AmountCents, &i.Currency, &seller, &buyer, &drawer, &i.Category, &i.Status, &message, &raw, &notes, &i.CreatedAt, &i.UpdatedAt, &i.Version, &i.ExtractionToken, &i.Confidence, &i.ReviewReason)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, invoice.ErrNotFound
+	}
 	if err != nil {
 		return nil, err
 	}
-	inv.InvoiceNumber, inv.InvoiceDate = num.String, date.String
-	inv.SellerName, inv.BuyerName, inv.Drawer = seller.String, buyer.String, drawer.String
-	inv.ErrorMessage, inv.RawResponse, inv.Notes = errMsg.String, raw.String, notes.String
-	return &inv, nil
+	i.InvoiceNumber = number.String
+	i.InvoiceDate = date.String
+	i.SellerName = seller.String
+	i.BuyerName = buyer.String
+	i.Drawer = drawer.String
+	i.ErrorMessage = message.String
+	i.RawResponse = raw.String
+	i.Notes = notes.String
+	return &i, nil
 }
-
-// CreateInvoice inserts a new invoice record (typically in "processing" status).
-func (s *Store) CreateInvoice(inv *invoice.Invoice) (int64, error) {
-	res, err := s.db.Exec(`INSERT INTO invoices
-		(file_name, file_path, file_hash, status, category) VALUES (?, ?, ?, ?, ?)`,
-		inv.FileName, inv.FilePath, inv.FileHash, inv.Status, inv.Category)
+func (s *Store) CreateInvoice(ctx context.Context, i *invoice.Invoice) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `INSERT INTO invoices(file_name,file_path,file_hash,status,category) VALUES(?,?,?,?,?)`, i.FileName, i.FilePath, i.FileHash, invoice.StatusProcessing, invoice.CategoryOther)
 	if err != nil {
+		var se *sqlite.Error
+		if errors.As(err, &se) && se.Code() == 2067 {
+			return 0, invoice.ErrDuplicate
+		}
 		return 0, err
 	}
 	return res.LastInsertId()
 }
-
-// GetInvoice returns one invoice by ID.
-func (s *Store) GetInvoice(id int64) (*invoice.Invoice, error) {
-	row := s.db.QueryRow(`SELECT `+invoiceColumns+` FROM invoices WHERE id = ?`, id)
-	inv, err := scanInvoice(row)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	return inv, err
+func (s *Store) GetInvoice(ctx context.Context, id int64) (*invoice.Invoice, error) {
+	return scanInvoice(s.db.QueryRowContext(ctx, "SELECT "+invoiceColumns+" FROM invoices WHERE id=?", id))
 }
 
-// ProcessingIDs returns IDs of invoices stuck in "processing" status,
-// used to resume extraction after a restart.
-func (s *Store) ProcessingIDs() ([]int64, error) {
-	rows, err := s.db.Query(`SELECT id FROM invoices WHERE status = ?`, invoice.StatusProcessing)
+// RecoverPending is called once before workers start. Only one server may own a database.
+func (s *Store) RecoverPending(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE invoices SET extraction_token='', version=version+1 WHERE status=?`, invoice.StatusProcessing)
+	return err
+}
+
+// ClaimNext atomically claims one durable pending record.
+func (s *Store) ClaimNext(ctx context.Context) (*invoice.Invoice, error) {
+	token := rand.Text()
+	return scanInvoice(s.db.QueryRowContext(ctx, `UPDATE invoices SET extraction_token=?,updated_at=? WHERE id=(SELECT id FROM invoices WHERE status=? AND extraction_token='' ORDER BY id LIMIT 1) AND extraction_token='' RETURNING `+invoiceColumns, token, time.Now(), invoice.StatusProcessing))
+}
+func (s *Store) Release(ctx context.Context, id int64, token string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE invoices SET extraction_token='' WHERE id=? AND extraction_token=? AND status=?`, id, token, invoice.StatusProcessing)
+	return err
+}
+func changed(res sql.Result, err error) error {
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return invoice.ErrConflict
+	}
+	return nil
+}
+func (s *Store) MarkProcessing(ctx context.Context, id, version int64) error {
+	return changed(s.db.ExecContext(ctx, `UPDATE invoices SET status=?,extraction_token='',error_message=NULL,version=version+1,updated_at=? WHERE id=? AND version=? AND status<>?`, invoice.StatusProcessing, time.Now(), id, version, invoice.StatusProcessing))
+}
+func (s *Store) CompleteExtraction(ctx context.Context, id int64, token string, i *invoice.Invoice) error {
+	return changed(s.db.ExecContext(ctx, `UPDATE invoices SET invoice_number=?,invoice_date=?,amount=?,currency=?,seller_name=?,buyer_name=?,drawer=?,category=?,status=?,error_message=NULL,raw_response=?,confidence=?,review_reason=?,extraction_token='',version=version+1,updated_at=? WHERE id=? AND extraction_token=? AND status=?`, i.InvoiceNumber, i.InvoiceDate, i.AmountCents, i.Currency, i.SellerName, i.BuyerName, i.Drawer, i.Category, i.Status, i.RawResponse, i.Confidence, i.ReviewReason, time.Now(), id, token, invoice.StatusProcessing))
+}
+func (s *Store) FailExtraction(ctx context.Context, id int64, token, message, raw string) error {
+	return changed(s.db.ExecContext(ctx, `UPDATE invoices SET status=?,error_message=?,raw_response=?,extraction_token='',version=version+1,updated_at=? WHERE id=? AND extraction_token=? AND status=?`, invoice.StatusFailed, message, raw, time.Now(), id, token, invoice.StatusProcessing))
+}
+func (s *Store) SaveInvoice(ctx context.Context, i *invoice.Invoice) error {
+	return changed(s.db.ExecContext(ctx, `UPDATE invoices SET invoice_number=?,invoice_date=?,amount=?,currency=?,seller_name=?,buyer_name=?,drawer=?,category=?,notes=?,status=?,review_reason=?,error_message=?,version=version+1,updated_at=? WHERE id=? AND version=? AND status<>?`, i.InvoiceNumber, i.InvoiceDate, i.AmountCents, i.Currency, i.SellerName, i.BuyerName, i.Drawer, i.Category, i.Notes, i.Status, i.ReviewReason, i.ErrorMessage, time.Now(), i.ID, i.Version, invoice.StatusProcessing))
+}
+func (s *Store) DeleteInvoice(ctx context.Context, id, version int64) error {
+	return changed(s.db.ExecContext(ctx, `DELETE FROM invoices WHERE id=? AND version=? AND status<>?`, id, version, invoice.StatusProcessing))
+}
+
+// FilePaths supports read-only orphan reconciliation at startup.
+func (s *Store) FilePaths(ctx context.Context) (map[string]bool, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT file_path FROM invoices")
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var ids []int64
+	paths := map[string]bool{}
 	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
+		var path string
+		if err := rows.Scan(&path); err != nil {
 			return nil, err
 		}
-		ids = append(ids, id)
+		paths[path] = true
 	}
-	return ids, rows.Err()
+	return paths, rows.Err()
 }
 
-// FileHashExists reports whether a file with this hash was already imported.
-func (s *Store) FileHashExists(hash string) (bool, error) {
-	var n int
-	err := s.db.QueryRow(`SELECT COUNT(1) FROM invoices WHERE file_hash = ?`, hash).Scan(&n)
-	return n > 0, err
-}
-
-// DeleteInvoice removes the record and returns its file path for cleanup.
-func (s *Store) DeleteInvoice(id int64) (string, error) {
-	inv, err := s.GetInvoice(id)
-	if err != nil || inv == nil {
-		return "", err
-	}
-	_, err = s.db.Exec(`DELETE FROM invoices WHERE id = ?`, id)
-	return inv.FilePath, err
-}
-
-// MarkProcessing resets an invoice back to the processing state.
-func (s *Store) MarkProcessing(id int64) error {
-	_, err := s.db.Exec(`UPDATE invoices SET status = ?, error_message = NULL, updated_at = ? WHERE id = ?`,
-		invoice.StatusProcessing, time.Now(), id)
-	return err
-}
-
-// CompleteExtraction fills the extracted fields and marks the invoice done.
-func (s *Store) CompleteExtraction(id int64, inv *invoice.Invoice) error {
-	_, err := s.db.Exec(`UPDATE invoices SET
-		invoice_number = ?, invoice_date = ?, amount = ?, currency = ?,
-		seller_name = ?, buyer_name = ?, drawer = ?, category = ?,
-		status = ?, error_message = NULL, raw_response = ?, updated_at = ?
-		WHERE id = ?`,
-		inv.InvoiceNumber, inv.InvoiceDate, inv.AmountCents, inv.Currency,
-		inv.SellerName, inv.BuyerName, inv.Drawer, inv.Category,
-		invoice.StatusDone, inv.RawResponse, time.Now(), id)
-	return err
-}
-
-// FailExtraction marks the invoice failed with an error message.
-func (s *Store) FailExtraction(id int64, errMsg string) error {
-	_, err := s.db.Exec(`UPDATE invoices SET status = ?, error_message = ?, updated_at = ? WHERE id = ?`,
-		invoice.StatusFailed, errMsg, time.Now(), id)
-	return err
-}
-
-// UpdateFields applies a partial update from the given column->value map.
-// Column names are validated by the caller (handler whitelist).
-func (s *Store) UpdateFields(id int64, fields map[string]any) error {
-	if len(fields) == 0 {
-		return nil
-	}
-	type pair struct {
-		col string
-		val any
-	}
-	pairs := make([]pair, 0, len(fields))
-	for col, val := range fields {
-		pairs = append(pairs, pair{col, val})
-	}
-	sort.Slice(pairs, func(i, j int) bool { return pairs[i].col < pairs[j].col })
-	sets := make([]string, 0, len(pairs)+1)
-	args := make([]any, 0, len(pairs)+2)
-	for _, p := range pairs {
-		sets = append(sets, p.col+" = ?")
-		args = append(args, p.val)
-	}
-	sets = append(sets, "updated_at = ?")
-	args = append(args, time.Now(), id)
-	_, err := s.db.Exec(`UPDATE invoices SET `+strings.Join(sets, ", ")+` WHERE id = ?`, args...)
-	return err
-}
-
-// ListFilter controls ListInvoices queries.
 type ListFilter struct {
-	Page      int
-	PageSize  int
-	Category  string
-	Seller    string
-	Status    string
-	Keyword   string
-	StartDate string // YYYY-MM-DD, inclusive
-	EndDate   string // YYYY-MM-DD, inclusive
-	SortBy    string // invoice_date | amount | created_at
-	SortOrder string // asc | desc
+	Page, PageSize                                                           int
+	Category, Seller, Status, Keyword, StartDate, EndDate, SortBy, SortOrder string
 }
 
-// sortableColumns whitelists ORDER BY columns to prevent SQL injection.
-var sortableColumns = map[string]string{
-	"invoice_date": "invoice_date",
-	"amount":       "amount",
-	"created_at":   "created_at",
+func (f *ListFilter) Normalize() error {
+	if f.Page < 1 {
+		f.Page = 1
+	}
+	if f.Page > 1_000_000 {
+		return fmt.Errorf("page exceeds limit")
+	}
+	if f.PageSize < 1 || f.PageSize > 200 {
+		f.PageSize = 20
+	}
+	if f.Category != "" && !invoice.IsValidCategory(f.Category) {
+		return fmt.Errorf("invalid category")
+	}
+	if f.Status != "" && f.Status != invoice.StatusProcessing && f.Status != invoice.StatusDone && f.Status != invoice.StatusFailed && f.Status != invoice.StatusNeedsReview {
+		return fmt.Errorf("invalid status")
+	}
+	if len(f.Keyword) > 256 || len(f.Seller) > 4096 {
+		return fmt.Errorf("filter exceeds length limit")
+	}
+	return invoice.ValidateDateRange(f.StartDate, f.EndDate)
 }
-
-// ListInvoices returns one page plus the total row count.
-func (s *Store) ListInvoices(f ListFilter) ([]*invoice.Invoice, int, error) {
+func (s *Store) ListInvoices(ctx context.Context, f ListFilter) ([]*invoice.Invoice, int, error) {
+	if err := f.Normalize(); err != nil {
+		return nil, 0, err
+	}
 	var where []string
 	var args []any
-	if f.Category != "" {
-		where = append(where, "category = ?")
-		args = append(args, f.Category)
-	}
-	if f.Seller != "" {
-		where = append(where, "seller_name = ?")
-		args = append(args, f.Seller)
-	}
-	if f.Status != "" {
-		where = append(where, "status = ?")
-		args = append(args, f.Status)
+	for _, p := range []struct{ column, value string }{{"category", f.Category}, {"seller_name", f.Seller}, {"status", f.Status}} {
+		if p.value != "" {
+			where = append(where, p.column+"=?")
+			args = append(args, p.value)
+		}
 	}
 	if f.StartDate != "" {
-		where = append(where, "invoice_date >= ?")
+		where = append(where, "invoice_date>=?")
 		args = append(args, f.StartDate)
 	}
 	if f.EndDate != "" {
-		where = append(where, "invoice_date <= ?")
+		where = append(where, "invoice_date<=?")
 		args = append(args, f.EndDate)
 	}
 	if f.Keyword != "" {
 		where = append(where, `(invoice_number LIKE ? OR seller_name LIKE ? OR buyer_name LIKE ? OR drawer LIKE ? OR notes LIKE ?)`)
-		like := "%" + f.Keyword + "%"
-		args = append(args, like, like, like, like, like)
+		for range 5 {
+			args = append(args, "%"+f.Keyword+"%")
+		}
 	}
-	whereSQL := ""
+	clause := ""
 	if len(where) > 0 {
-		whereSQL = " WHERE " + strings.Join(where, " AND ")
+		clause = " WHERE " + strings.Join(where, " AND ")
 	}
-
 	var total int
-	if err := s.db.QueryRow(`SELECT COUNT(1) FROM invoices`+whereSQL, args...).Scan(&total); err != nil {
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM invoices"+clause, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-
-	col := sortableColumns["invoice_date"]
-	if c, ok := sortableColumns[f.SortBy]; ok {
-		col = c
+	col := map[string]string{"invoice_date": "invoice_date", "amount": "amount", "created_at": "created_at"}[f.SortBy]
+	if col == "" {
+		col = "invoice_date"
 	}
 	order := "DESC"
-	if strings.EqualFold(f.SortOrder, "asc") {
+	if f.SortOrder == "asc" {
 		order = "ASC"
 	}
-
-	page := f.Page
-	if page < 1 {
-		page = 1
-	}
-	pageSize := f.PageSize
-	if pageSize < 1 || pageSize > 200 {
-		pageSize = 20
-	}
-	offset := (page - 1) * pageSize
-
-	rows, err := s.db.Query(`SELECT `+invoiceColumns+` FROM invoices`+whereSQL+
-		fmt.Sprintf(` ORDER BY %s %s, id %s LIMIT ? OFFSET ?`, col, order, order),
-		append(args, pageSize, offset)...)
+	rows, err := s.db.QueryContext(ctx, "SELECT "+invoiceColumns+" FROM invoices"+clause+fmt.Sprintf(" ORDER BY %s %s,id %s LIMIT ? OFFSET ?", col, order, order), append(args, f.PageSize, (f.Page-1)*f.PageSize)...)
 	if err != nil {
 		return nil, 0, err
 	}
 	defer rows.Close()
-
-	var items []*invoice.Invoice
+	items := make([]*invoice.Invoice, 0)
 	for rows.Next() {
-		inv, err := scanInvoice(rows)
+		i, err := scanInvoice(rows)
 		if err != nil {
 			return nil, 0, err
 		}
-		items = append(items, inv)
+		i.RawResponse = ""
+		items = append(items, i)
 	}
 	return items, total, rows.Err()
 }
 
-// StatRow is one aggregated bucket.
 type StatRow struct {
-	Period     string `json:"period"`
-	Count      int    `json:"count"`
-	TotalCents int64  `json:"total_cents"`
+	Period     string
+	Count      int
+	TotalCents int64
 }
 
-// statsDateFilter is the shared constant WHERE clause. Date bounds are
-// nullable parameters: an empty string disables the bound.
-const statsDateFilter = `status = 'done' AND invoice_date IS NOT NULL AND invoice_date != ''
-	AND (? = '' OR invoice_date >= ?) AND (? = '' OR invoice_date <= ?)`
-
-// Stats aggregates done invoices by the given dimension within a date range.
-// Every branch uses a fully constant query string; all user input is bound
-// as parameters.
-func (s *Store) Stats(groupBy, startDate, endDate string) ([]StatRow, error) {
-	args := []any{startDate, startDate, endDate, endDate}
-	var rows *sql.Rows
-	var err error
-	switch groupBy {
-	case "day":
-		rows, err = s.db.Query(`SELECT invoice_date AS period, COUNT(1) AS count, SUM(amount) AS total FROM invoices WHERE `+statsDateFilter+` GROUP BY invoice_date ORDER BY period ASC`, args...)
-	case "month":
-		rows, err = s.db.Query(`SELECT substr(invoice_date, 1, 7) AS period, COUNT(1) AS count, SUM(amount) AS total FROM invoices WHERE `+statsDateFilter+` GROUP BY substr(invoice_date, 1, 7) ORDER BY period ASC`, args...)
-	case "year":
-		rows, err = s.db.Query(`SELECT substr(invoice_date, 1, 4) AS period, COUNT(1) AS count, SUM(amount) AS total FROM invoices WHERE `+statsDateFilter+` GROUP BY substr(invoice_date, 1, 4) ORDER BY period ASC`, args...)
-	case "seller":
-		rows, err = s.db.Query(`SELECT COALESCE(NULLIF(seller_name, ''), '(未知)') AS period, COUNT(1) AS count, SUM(amount) AS total FROM invoices WHERE `+statsDateFilter+` GROUP BY seller_name ORDER BY total DESC LIMIT 20`, args...)
-	case "category":
-		rows, err = s.db.Query(`SELECT category AS period, COUNT(1) AS count, SUM(amount) AS total FROM invoices WHERE `+statsDateFilter+` GROUP BY category ORDER BY total DESC`, args...)
-	default:
-		return nil, fmt.Errorf("invalid group_by: %q", groupBy)
+func (s *Store) Stats(ctx context.Context, group, start, end, currency string) ([]StatRow, error) {
+	if err := invoice.ValidateDateRange(start, end); err != nil {
+		return nil, err
 	}
+	if !invoice.ValidCurrency(currency) {
+		return nil, fmt.Errorf("unsupported currency")
+	}
+	expression := map[string]string{"day": "invoice_date", "month": "substr(invoice_date,1,7)", "year": "substr(invoice_date,1,4)", "seller": "COALESCE(NULLIF(seller_name,''),'(unknown)')", "category": "category"}[group]
+	if expression == "" {
+		return nil, fmt.Errorf("invalid group_by")
+	}
+	order := "period ASC"
+	if group == "seller" {
+		order = "total DESC LIMIT 20"
+	}
+	if group == "category" {
+		order = "total DESC"
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT `+expression+` AS period,COUNT(*),SUM(amount) AS total FROM invoices WHERE status=? AND currency=? AND invoice_date<>'' AND (?='' OR invoice_date>=?) AND (?='' OR invoice_date<=?) GROUP BY `+expression+` ORDER BY `+order, invoice.StatusDone, currency, start, start, end, end)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-
-	var out []StatRow
+	out := make([]StatRow, 0)
 	for rows.Next() {
 		var r StatRow
 		if err := rows.Scan(&r.Period, &r.Count, &r.TotalCents); err != nil {
@@ -389,21 +315,41 @@ func (s *Store) Stats(groupBy, startDate, endDate string) ([]StatRow, error) {
 	return out, rows.Err()
 }
 
-// Summary returns headline numbers for the dashboard.
-func (s *Store) Summary() (*StatRow, *StatRow, error) {
-	var total StatRow
-	err := s.db.QueryRow(`SELECT 'all', COUNT(1), COALESCE(SUM(amount), 0)
-		FROM invoices WHERE status = 'done'`).Scan(&total.Period, &total.Count, &total.TotalCents)
-	if err != nil {
-		return nil, nil, err
-	}
+type CurrencySummary struct {
+	Currency    string  `json:"currency"`
+	TotalCount  int     `json:"total_count"`
+	TotalAmount float64 `json:"total_amount"`
+	MonthCount  int     `json:"month_count"`
+	MonthAmount float64 `json:"month_amount"`
+	ReviewCount int     `json:"review_count"`
+}
+
+// Summary aggregates each currency separately: amounts from different
+// currencies are never added together.
+func (s *Store) Summary(ctx context.Context) ([]CurrencySummary, error) {
 	month := time.Now().Format("2006-01")
-	var m StatRow
-	err = s.db.QueryRow(`SELECT 'month', COUNT(1), COALESCE(SUM(amount), 0)
-		FROM invoices WHERE status = 'done' AND substr(invoice_date, 1, 7) = ?`, month).
-		Scan(&m.Period, &m.Count, &m.TotalCents)
+	rows, err := s.db.QueryContext(ctx, `SELECT currency,
+		COALESCE(SUM(CASE WHEN status='done' THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN status='done' THEN amount ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN status='done' AND substr(invoice_date,1,7)=? THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN status='done' AND substr(invoice_date,1,7)=? THEN amount ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN status=? THEN 1 ELSE 0 END),0)
+		FROM invoices WHERE status IN (?,?) GROUP BY currency ORDER BY currency`,
+		month, month, invoice.StatusNeedsReview, invoice.StatusDone, invoice.StatusNeedsReview)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return &total, &m, nil
+	defer rows.Close()
+	result := make([]CurrencySummary, 0)
+	for rows.Next() {
+		var r CurrencySummary
+		var total, monthTotal int64
+		if err := rows.Scan(&r.Currency, &r.TotalCount, &total, &r.MonthCount, &monthTotal, &r.ReviewCount); err != nil {
+			return nil, err
+		}
+		r.TotalAmount = float64(total) / 100
+		r.MonthAmount = float64(monthTotal) / 100
+		result = append(result, r)
+	}
+	return result, rows.Err()
 }
