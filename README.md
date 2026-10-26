@@ -9,10 +9,17 @@ categorize them automatically, then explore the data with multi-dimensional stat
 - **Smart import**: one multimodal LLM call (OpenAI-compatible API) handles both OCR
   extraction and auto-categorization (transport / dining / accommodation /
   tech service / other); PDFs are rendered with an embedded PDFium (WebAssembly)
+- **Review before counting**: extraction results that miss an amount, invoice number
+  or seller, or that come back with low confidence, land in `needs_review` and stay
+  out of the statistics until a human confirms them
 - **Multi-dimensional stats**: aggregate by day / month / year / seller / category,
-  visualized with charts on the dashboard
-- **Invoice management**: keyword search, date-range and category filters, manual
-  corrections, retry on failure, original file preview
+  visualized with charts on the dashboard; every figure is scoped to a single
+  currency (amounts are never converted or summed across currencies)
+- **Invoice management**: keyword search, date-range, category and status filters,
+  manual corrections, retry on failure, original file preview
+- **Safe concurrency**: uploads are stored per request (no shared file paths), edits
+  carry the record version so stale tabs cannot overwrite newer data, and queued
+  extraction work is persisted in SQLite and reclaimed after a crash
 - **Token auth**: no usernames or passwords; a pre-shared hashed token is verified and
   exchanged for a JWT (7 days)
 - **One-step deployment**: the frontend is embedded into the Go binary, no CGO
@@ -72,9 +79,25 @@ Deploying to a server only requires copying two files: `sorter` (the binary) and
 `config.yaml`. Data (SQLite database + uploaded files) is written to `./data/` by
 default.
 
+> Run exactly one instance per database. The in-process worker pool owns the
+> queue, and startup reclaims rows that were interrupted mid-extraction; two
+> processes sharing one database would compete for the same work.
+
 Settings can also be overridden with environment variables: `SORTER_ADDR`,
 `SORTER_TOKEN_HASH`, `SORTER_LLM_BASE_URL`, `SORTER_LLM_API_KEY`,
-`SORTER_LLM_MODEL`, and more.
+`SORTER_LLM_MODEL`, and more. Unknown YAML keys are rejected so typos fail at
+startup instead of silently falling back to defaults.
+
+### Limits and data rules
+
+| Rule | Value |
+| --- | --- |
+| Max file size | 32 MiB per file |
+| Max request size | 128 MiB, up to 20 files per upload |
+| Accepted types | JPG / JPEG / PNG / WebP / single-page PDF (content and dimensions are verified) |
+| Amounts | stored in minor units; max two decimals; negative values are allowed for red invoices |
+| Currencies | CNY, USD, EUR, GBP, HKD, JPY, CAD, AUD, SGD, CHF, KRW, NZD |
+| Sessions | invalidated when the process restarts or `auth.token_hash` changes |
 
 ## Development
 
@@ -92,6 +115,20 @@ make dev-backend    # go run ./cmd/sorter -config config.yaml
 # Terminal 2: frontend hot reload (Vite 8 / Rolldown proxies /api to :8080)
 make dev-frontend   # cd web && pnpm run dev
 ```
+
+## Testing
+
+```bash
+make test     # go test ./...
+make check    # go test + go vet + TypeScript typecheck
+```
+
+CI runs the same checks (`.github/workflows/ci.yml`): `go vet`, `go test -race`,
+a clean `go build`, and the frontend typecheck plus production build.
+
+Covered regression areas: per-request upload paths and duplicate cleanup, stale
+version rejection, exclusive job claiming and release on shutdown, currency-scoped
+statistics, review-state transitions, JWT handling, and config validation.
 
 ## Cross-compilation (no CGO required)
 
